@@ -8,7 +8,134 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
+
+// Data type constants (string identifiers)
+const (
+	TypeString    = "string"
+	TypeList      = "list"
+	TypeSet       = "set"
+	TypeHash      = "hash"
+	TypeSortedSet = "sortedset"
+)
+
+// Data type constants (numeric identifiers for future optimization)
+const (
+	TypeStringID    = 1
+	TypeListID      = 2
+	TypeSetID       = 3
+	TypeHashID      = 4
+	TypeSortedSetID = 5
+)
+
+// Entry represents a single key-value entry in the store
+type Entry struct {
+	Type      string      // Data type (string, list, set, hash, sortedset)
+	Value     interface{} // Actual data (cast based on Type)
+	ExpiresAt time.Time   // TTL expiration time (zero value means no expiration)
+}
+
+// Store represents the in-memory database
+type Store struct {
+	data map[string]*Entry // Key-value storage
+	mu   sync.RWMutex      // Read-write mutex for synchronization
+}
+
+// NewStore creates and initializes a new Store instance
+func NewStore() *Store {
+	return &Store{
+		data: make(map[string]*Entry),
+	}
+}
+
+// Get retrieves a string value for the given key
+// Returns (value, exists, isCorrectType)
+func (s *Store) Get(key string) (string, bool, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	
+	entry, exists := s.data[key]
+	if !exists {
+		return "", false, true // Key doesn't exist, but type would be correct
+	}
+	
+	// Check if the entry is of string type
+	if entry.Type != TypeString {
+		return "", true, false // Key exists but wrong type
+	}
+	
+	// Retrieve the string value
+	value, ok := entry.Value.(string)
+	if !ok {
+		return "", true, false // Type assertion failed
+	}
+	
+	return value, true, true
+}
+
+// Set stores a string value for the given key
+func (s *Store) Set(key string, val string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	// Create a new entry of string type
+	entry := &Entry{
+		Type:      TypeString,
+		Value:     val,
+		ExpiresAt: time.Time{}, // No expiration (zero value)
+	}
+	
+	// Insert or replace the entry
+	s.data[key] = entry
+	
+	return "OK"
+}
+
+// Del deletes one or more keys and returns the count of deleted keys
+func (s *Store) Del(keys ...string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	count := 0
+	for _, key := range keys {
+		if _, exists := s.data[key]; exists {
+			delete(s.data, key)
+			count++
+		}
+	}
+	
+	return count
+}
+
+// Helper method to check if a key exists and get its type
+func (s *Store) KeyType(key string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	
+	entry, exists := s.data[key]
+	if !exists {
+		return "", false
+	}
+	return entry.Type, true
+}
+
+// Helper method to set a non-string value for testing WRONGTYPE scenarios
+func (s *Store) SetForTesting(key string, entryType string, value interface{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	entry := &Entry{
+		Type:      entryType,
+		Value:     value,
+		ExpiresAt: time.Time{},
+	}
+	s.data[key] = entry
+}
+
+// Global store instance
+var store = NewStore()
 
 func main() {
 	listener, err := net.Listen("tcp", ":6379")
@@ -192,9 +319,6 @@ func formatInteger(val int) string {
 }
 
 func formatBulkString(msg string) string {
-	if msg == "" {
-		return "$-1\r\n"
-	}
 	return "$" + strconv.Itoa(len(msg)) + "\r\n" + msg + "\r\n"
 }
 
@@ -259,9 +383,62 @@ func handleConnection(conn net.Conn) {
 				return
 			}
 			
+		case "GET":
+			// GET key
+			if len(cmdParts) != 2 {
+				_, err = conn.Write([]byte(formatError("ERR wrong number of arguments for 'get' command")))
+			} else {
+				key := cmdParts[1]
+				value, exists, isCorrectType := store.Get(key)
+				
+				if exists && !isCorrectType {
+					// Key exists but wrong type
+					_, err = conn.Write([]byte(formatError("WRONGTYPE Operation against a key holding the wrong kind of value")))
+				} else if !exists {
+					// Key not found - return nil bulk string
+					_, err = conn.Write([]byte("$-1\r\n"))
+				} else {
+					// Key found and correct type
+					_, err = conn.Write([]byte(formatBulkString(value)))
+				}
+			}
+			if err != nil {
+				fmt.Printf("Error writing GET response: %v\n", err)
+				return
+			}
+			
+		case "SET":
+			// SET key value
+			if len(cmdParts) != 3 {
+				_, err = conn.Write([]byte(formatError("ERR wrong number of arguments for 'set' command")))
+			} else {
+				key := cmdParts[1]
+				value := cmdParts[2]
+				result := store.Set(key, value)
+				_, err = conn.Write([]byte(formatSimpleString(result)))
+			}
+			if err != nil {
+				fmt.Printf("Error writing SET response: %v\n", err)
+				return
+			}
+			
+		case "DEL":
+			// DEL key [key ...]
+			if len(cmdParts) < 2 {
+				_, err = conn.Write([]byte(formatError("ERR wrong number of arguments for 'del' command")))
+			} else {
+				keys := cmdParts[1:] // All arguments after command name
+				count := store.Del(keys...)
+				_, err = conn.Write([]byte(formatInteger(count)))
+			}
+			if err != nil {
+				fmt.Printf("Error writing DEL response: %v\n", err)
+				return
+			}
+			
 		default:
 			// Unknown command
-			_, err = conn.Write([]byte(formatError("ERR unknown command")))
+			_, err = conn.Write([]byte(formatError(fmt.Sprintf("ERR unknown command '%s'", strings.ToLower(command)))))
 			if err != nil {
 				fmt.Printf("Error writing unknown command response: %v\n", err)
 				return
